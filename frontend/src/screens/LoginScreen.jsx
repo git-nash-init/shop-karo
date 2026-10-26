@@ -8,6 +8,7 @@ import FormContainer from '../components/FormContainer';
 import { useLoginMutation } from '../slices/usersApiSlice';
 import { setCredentials } from '../slices/authSlice';
 import { toast } from 'react-toastify';
+import supabase from '../supabase';
 
 const TEST_CREDENTIALS = [
   {
@@ -76,11 +77,53 @@ const LoginScreen = () => {
     }
 
     try {
+      // 1. Primary: Try backend API login
       const res = await login({ email: cleanEmail, password: cleanPassword }).unwrap();
       dispatch(setCredentials({ ...res }));
       navigate(redirect);
     } catch (err) {
-      toast.error(err?.data?.message || err.error || 'Authentication failed');
+      // 2. Resilient Fallback: If backend returns 401 or encounters serverless delay,
+      // authenticate directly through Supabase Auth client
+      try {
+        const { data, error: supaError } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password: cleanPassword,
+        });
+
+        if (supaError || !data?.user) {
+          throw new Error(
+            supaError?.message || err?.data?.message || err?.error || 'Invalid email or password'
+          );
+        }
+
+        // Fetch user profile from Supabase profiles table
+        let { data: profile } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', data.user.id)
+          .single();
+
+        const userPayload = {
+          _id: data.user.id,
+          name: profile?.name || data.user.user_metadata?.name || data.user.email.split('@')[0],
+          email: data.user.email,
+          isAdmin: profile?.is_admin || false,
+          avatarUrl: profile?.avatar_url || '',
+          phone: profile?.phone || '',
+          address: profile?.address || '',
+          city: profile?.city || '',
+          postalCode: profile?.postal_code || '',
+          country: profile?.country || '',
+          onboardingCompleted: Boolean(profile?.onboarding_completed),
+          preferences: profile?.preferences || {},
+          token: data.session?.access_token,
+        };
+
+        dispatch(setCredentials(userPayload));
+        navigate(redirect);
+      } catch (fallbackErr) {
+        toast.error(fallbackErr?.message || 'Invalid email or password');
+      }
     }
   };
 
