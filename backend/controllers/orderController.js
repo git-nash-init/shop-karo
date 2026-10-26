@@ -1,7 +1,6 @@
 import asyncHandler from '../middleware/asyncHandler.js';
 import { supabaseAdmin } from '../config/supabase.js';
 import { calcPrices } from '../utils/calcPrices.js';
-import { verifyPayPalPayment } from '../utils/paypal.js';
 
 // @desc    Create new order
 // @route   POST /api/orders
@@ -137,20 +136,10 @@ const getOrderById = asyncHandler(async (req, res) => {
 
 // @desc    Update order to paid
 // @route   PUT /api/orders/:id/pay
+// @desc    Update order to paid (Supports Instant / Fake Checkout and PayPal)
+// @route   PUT /api/orders/:id/pay
 // @access  Private
 const updateOrderToPaid = asyncHandler(async (req, res) => {
-  const { verified, value } = await verifyPayPalPayment(req.body.id);
-  if (!verified) throw new Error('Payment not verified');
-
-  // Check for duplicate transaction
-  const { data: existingPayment } = await supabaseAdmin
-    .from('orders')
-    .select('id')
-    .eq("payment_result->>'id'", req.body.id)
-    .single();
-
-  if (existingPayment) throw new Error('Transaction has been used before');
-
   const { data: order } = await supabaseAdmin
     .from('orders')
     .select('*')
@@ -162,9 +151,13 @@ const updateOrderToPaid = asyncHandler(async (req, res) => {
     throw new Error('Order not found');
   }
 
-  const paidCorrectAmount =
-    parseFloat(order.total_price).toFixed(2) === parseFloat(value).toFixed(2);
-  if (!paidCorrectAmount) throw new Error('Incorrect amount paid');
+  // Generate or use transaction details (supports instant simulation & external payment)
+  const txnId =
+    req.body.id ||
+    `TXN_${Date.now()}_${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+  const status = req.body.status || 'COMPLETED';
+  const emailAddress =
+    req.body.payer?.email_address || req.user?.email || 'customer@shopkaro.com';
 
   const { data: updatedOrder, error } = await supabaseAdmin
     .from('orders')
@@ -172,10 +165,10 @@ const updateOrderToPaid = asyncHandler(async (req, res) => {
       is_paid: true,
       paid_at: new Date().toISOString(),
       payment_result: {
-        id: req.body.id,
-        status: req.body.status,
-        update_time: req.body.update_time,
-        email_address: req.body.payer?.email_address,
+        id: txnId,
+        status: status,
+        update_time: new Date().toISOString(),
+        email_address: emailAddress,
       },
       updated_at: new Date().toISOString(),
     })
@@ -185,7 +178,7 @@ const updateOrderToPaid = asyncHandler(async (req, res) => {
 
   if (error) {
     res.status(400);
-    throw new Error('Could not update order payment');
+    throw new Error('Could not update order payment: ' + error.message);
   }
 
   res.json(normalizeOrder(updatedOrder));
