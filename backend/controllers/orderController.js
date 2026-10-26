@@ -1,8 +1,7 @@
 import asyncHandler from '../middleware/asyncHandler.js';
-import Order from '../models/orderModel.js';
-import Product from '../models/productModel.js';
+import { supabaseAdmin } from '../config/supabase.js';
 import { calcPrices } from '../utils/calcPrices.js';
-import { verifyPayPalPayment, checkIfNewTransaction } from '../utils/paypal.js';
+import { verifyPayPalPayment } from '../utils/paypal.js';
 
 // @desc    Create new order
 // @route   POST /api/orders
@@ -10,143 +9,297 @@ import { verifyPayPalPayment, checkIfNewTransaction } from '../utils/paypal.js';
 const addOrderItems = asyncHandler(async (req, res) => {
   const { orderItems, shippingAddress, paymentMethod } = req.body;
 
-  if (orderItems && orderItems.length === 0) {
+  if (!orderItems || orderItems.length === 0) {
     res.status(400);
     throw new Error('No order items');
-  } else {
-    // NOTE: here we must assume that the prices from our client are incorrect.
-    // We must only trust the price of the item as it exists in
-    // our DB. This prevents a user paying whatever they want by hacking our client
-    // side code - https://gist.github.com/bushblade/725780e6043eaf59415fbaf6ca7376ff
-
-    // get the ordered items from our database
-    const itemsFromDB = await Product.find({
-      _id: { $in: orderItems.map((x) => x._id) },
-    });
-
-    // map over the order items and use the price from our items from database
-    const dbOrderItems = orderItems.map((itemFromClient) => {
-      const matchingItemFromDB = itemsFromDB.find(
-        (itemFromDB) => itemFromDB._id.toString() === itemFromClient._id
-      );
-      return {
-        ...itemFromClient,
-        product: itemFromClient._id,
-        price: matchingItemFromDB.price,
-        _id: undefined,
-      };
-    });
-
-    // calculate prices
-    const { itemsPrice, taxPrice, shippingPrice, totalPrice } =
-      calcPrices(dbOrderItems);
-
-    const order = new Order({
-      orderItems: dbOrderItems,
-      user: req.user._id,
-      shippingAddress,
-      paymentMethod,
-      itemsPrice,
-      taxPrice,
-      shippingPrice,
-      totalPrice,
-    });
-
-    const createdOrder = await order.save();
-
-    res.status(201).json(createdOrder);
   }
+
+  // Fetch actual prices from DB to prevent client-side price manipulation
+  const productIds = orderItems.map((x) => x._id);
+
+  const { data: dbProducts, error: productError } = await supabaseAdmin
+    .from('products')
+    .select('id, name, price, image')
+    .in('id', productIds);
+
+  if (productError || !dbProducts) {
+    res.status(400);
+    throw new Error('Could not validate product prices');
+  }
+
+  const dbProductMap = Object.fromEntries(dbProducts.map((p) => [p.id, p]));
+
+  const dbOrderItems = orderItems.map((item) => {
+    const dbProduct = dbProductMap[item._id];
+    if (!dbProduct) throw new Error(`Product ${item._id} not found`);
+    return {
+      product: item._id,
+      name: dbProduct.name,
+      image: dbProduct.image,
+      price: parseFloat(dbProduct.price),
+      qty: item.qty,
+    };
+  });
+
+  const { itemsPrice, taxPrice, shippingPrice, totalPrice } =
+    calcPrices(dbOrderItems);
+
+  // Insert the order
+  const { data: order, error: orderError } = await supabaseAdmin
+    .from('orders')
+    .insert({
+      user_id: req.user._id,
+      shipping_address: shippingAddress,
+      payment_method: paymentMethod,
+      items_price: parseFloat(itemsPrice),
+      tax_price: parseFloat(taxPrice),
+      shipping_price: parseFloat(shippingPrice),
+      total_price: parseFloat(totalPrice),
+    })
+    .select()
+    .single();
+
+  if (orderError || !order) {
+    res.status(400);
+    throw new Error('Could not create order: ' + (orderError?.message || ''));
+  }
+
+  // Insert order items
+  const orderItemsToInsert = dbOrderItems.map((item) => ({
+    order_id: order.id,
+    product_id: item.product,
+    name: item.name,
+    quantity: item.qty,
+    image: item.image,
+    price: item.price,
+  }));
+
+  const { error: itemsError } = await supabaseAdmin
+    .from('order_items')
+    .insert(orderItemsToInsert);
+
+  if (itemsError) {
+    // Rollback: delete the order if items failed
+    await supabaseAdmin.from('orders').delete().eq('id', order.id);
+    res.status(400);
+    throw new Error('Could not create order items');
+  }
+
+  // Fetch the full order with items to return
+  const fullOrder = await fetchFullOrder(order.id);
+
+  res.status(201).json(fullOrder);
 });
 
 // @desc    Get logged in user orders
 // @route   GET /api/orders/myorders
 // @access  Private
 const getMyOrders = asyncHandler(async (req, res) => {
-  const orders = await Order.find({ user: req.user._id });
-  res.json(orders);
+  const { data: orders, error } = await supabaseAdmin
+    .from('orders')
+    .select(`
+      *,
+      order_items (*)
+    `)
+    .eq('user_id', req.user._id)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    res.status(500);
+    throw new Error('Could not fetch orders');
+  }
+
+  res.json(orders.map(normalizeOrder));
 });
 
 // @desc    Get order by ID
 // @route   GET /api/orders/:id
 // @access  Private
 const getOrderById = asyncHandler(async (req, res) => {
-  const order = await Order.findById(req.params.id).populate(
-    'user',
-    'name email'
-  );
+  const order = await fetchFullOrder(req.params.id);
 
-  if (order) {
-    res.json(order);
-  } else {
+  if (!order) {
     res.status(404);
     throw new Error('Order not found');
   }
+
+  // Users can only access their own orders (admins can access all - checked by admin middleware on the route)
+  if (
+    order.user._id.toString() !== req.user._id.toString() &&
+    !req.user.isAdmin
+  ) {
+    res.status(403);
+    throw new Error('Not authorized to view this order');
+  }
+
+  res.json(order);
 });
 
 // @desc    Update order to paid
 // @route   PUT /api/orders/:id/pay
 // @access  Private
 const updateOrderToPaid = asyncHandler(async (req, res) => {
-  // NOTE: here we need to verify the payment was made to PayPal before marking
-  // the order as paid
   const { verified, value } = await verifyPayPalPayment(req.body.id);
   if (!verified) throw new Error('Payment not verified');
 
-  // check if this transaction has been used before
-  const isNewTransaction = await checkIfNewTransaction(Order, req.body.id);
-  if (!isNewTransaction) throw new Error('Transaction has been used before');
+  // Check for duplicate transaction
+  const { data: existingPayment } = await supabaseAdmin
+    .from('orders')
+    .select('id')
+    .eq("payment_result->>'id'", req.body.id)
+    .single();
 
-  const order = await Order.findById(req.params.id);
+  if (existingPayment) throw new Error('Transaction has been used before');
 
-  if (order) {
-    // check the correct amount was paid
-    const paidCorrectAmount = order.totalPrice.toString() === value;
-    if (!paidCorrectAmount) throw new Error('Incorrect amount paid');
+  const { data: order } = await supabaseAdmin
+    .from('orders')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
 
-    order.isPaid = true;
-    order.paidAt = Date.now();
-    order.paymentResult = {
-      id: req.body.id,
-      status: req.body.status,
-      update_time: req.body.update_time,
-      email_address: req.body.payer.email_address,
-    };
-
-    const updatedOrder = await order.save();
-
-    res.json(updatedOrder);
-  } else {
+  if (!order) {
     res.status(404);
     throw new Error('Order not found');
   }
+
+  const paidCorrectAmount =
+    parseFloat(order.total_price).toFixed(2) === parseFloat(value).toFixed(2);
+  if (!paidCorrectAmount) throw new Error('Incorrect amount paid');
+
+  const { data: updatedOrder, error } = await supabaseAdmin
+    .from('orders')
+    .update({
+      is_paid: true,
+      paid_at: new Date().toISOString(),
+      payment_result: {
+        id: req.body.id,
+        status: req.body.status,
+        update_time: req.body.update_time,
+        email_address: req.body.payer?.email_address,
+      },
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) {
+    res.status(400);
+    throw new Error('Could not update order payment');
+  }
+
+  res.json(normalizeOrder(updatedOrder));
 });
 
 // @desc    Update order to delivered
-// @route   GET /api/orders/:id/deliver
+// @route   PUT /api/orders/:id/deliver
 // @access  Private/Admin
 const updateOrderToDelivered = asyncHandler(async (req, res) => {
-  const order = await Order.findById(req.params.id);
+  const { data: updatedOrder, error } = await supabaseAdmin
+    .from('orders')
+    .update({
+      is_delivered: true,
+      delivered_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
 
-  if (order) {
-    order.isDelivered = true;
-    order.deliveredAt = Date.now();
-
-    const updatedOrder = await order.save();
-
-    res.json(updatedOrder);
-  } else {
+  if (error || !updatedOrder) {
     res.status(404);
     throw new Error('Order not found');
   }
+
+  res.json(normalizeOrder(updatedOrder));
 });
 
 // @desc    Get all orders
 // @route   GET /api/orders
 // @access  Private/Admin
 const getOrders = asyncHandler(async (req, res) => {
-  const orders = await Order.find({}).populate('user', 'id name');
-  res.json(orders);
+  const { data: orders, error } = await supabaseAdmin
+    .from('orders')
+    .select(`
+      *,
+      order_items (*),
+      profiles!orders_user_id_fkey (
+        id,
+        name
+      )
+    `)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    res.status(500);
+    throw new Error('Could not fetch orders');
+  }
+
+  res.json(orders.map((o) => normalizeOrder(o, true)));
 });
+
+// Helper: fetch a full order with items and user info
+async function fetchFullOrder(orderId) {
+  const { data: order, error } = await supabaseAdmin
+    .from('orders')
+    .select(`
+      *,
+      order_items (*),
+      profiles!orders_user_id_fkey (
+        id,
+        name
+      )
+    `)
+    .eq('id', orderId)
+    .single();
+
+  if (error || !order) return null;
+
+  // Get user email from auth
+  const {
+    data: { user: authUser },
+  } = await supabaseAdmin.auth.admin.getUserById(order.user_id);
+
+  return normalizeOrder(order, true, authUser?.email);
+}
+
+// Helper: normalize Supabase order to camelCase for frontend
+function normalizeOrder(o, includeUser = false, userEmail = '') {
+  const normalized = {
+    _id: o.id,
+    orderItems: (o.order_items || []).map((item) => ({
+      _id: item.id,
+      product: item.product_id,
+      name: item.name,
+      qty: item.quantity,
+      image: item.image,
+      price: parseFloat(item.price),
+    })),
+    shippingAddress: o.shipping_address || {},
+    paymentMethod: o.payment_method,
+    paymentResult: o.payment_result || {},
+    itemsPrice: parseFloat(o.items_price),
+    taxPrice: parseFloat(o.tax_price),
+    shippingPrice: parseFloat(o.shipping_price),
+    totalPrice: parseFloat(o.total_price),
+    isPaid: o.is_paid,
+    paidAt: o.paid_at,
+    isDelivered: o.is_delivered,
+    deliveredAt: o.delivered_at,
+    createdAt: o.created_at,
+    updatedAt: o.updated_at,
+  };
+
+  if (includeUser) {
+    normalized.user = {
+      _id: o.profiles?.id || o.user_id,
+      name: o.profiles?.name || '',
+      email: userEmail || '',
+    };
+  }
+
+  return normalized;
+}
 
 export {
   addOrderItems,

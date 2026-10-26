@@ -1,5 +1,5 @@
 import { apiSlice } from './apiSlice';
-import { USERS_URL } from '../constants';
+import { USERS_URL, UPLOAD_URL } from '../constants';
 
 export const userApiSlice = apiSlice.injectEndpoints({
   endpoints: (builder) => ({
@@ -13,6 +13,20 @@ export const userApiSlice = apiSlice.injectEndpoints({
     register: builder.mutation({
       query: (data) => ({
         url: `${USERS_URL}`,
+        method: 'POST',
+        body: data,
+      }),
+    }),
+    completeOnboarding: builder.mutation({
+      query: (data) => ({
+        url: `${USERS_URL}/onboarding`,
+        method: 'PUT',
+        body: data,
+      }),
+    }),
+    uploadAvatar: builder.mutation({
+      query: (data) => ({
+        url: `${UPLOAD_URL}/avatar`,
         method: 'POST',
         body: data,
       }),
@@ -64,6 +78,8 @@ export const {
   useLoginMutation,
   useLogoutMutation,
   useRegisterMutation,
+  useCompleteOnboardingMutation,
+  useUploadAvatarMutation,
   useProfileMutation,
   useGetUsersQuery,
   useDeleteUserMutation,

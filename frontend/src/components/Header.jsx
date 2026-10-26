@@ -52,7 +52,38 @@ const Header = () => {
               </Nav.Link>
               {userInfo ? (
                 <>
-                  <NavDropdown title={userInfo.name} id='username'>
+                  <NavDropdown
+                    title={
+                      <span className='d-inline-flex align-items-center'>
+                        {userInfo.avatarUrl ? (
+                          <img
+                            src={userInfo.avatarUrl}
+                            alt={userInfo.name}
+                            style={{
+                              width: '26px',
+                              height: '26px',
+                              borderRadius: '50%',
+                              objectFit: 'cover',
+                              marginRight: '8px',
+                              border: '1px solid #fff',
+                            }}
+                          />
+                        ) : null}
+                        {userInfo.name}
+                        {!userInfo.onboardingCompleted && (
+                          <Badge bg='warning' text='dark' pill className='ms-2' style={{ fontSize: '0.65rem' }}>
+                            Setup
+                          </Badge>
+                        )}
+                      </span>
+                    }
+                    id='username'
+                  >
+                    {!userInfo.onboardingCompleted && (
+                      <NavDropdown.Item as={Link} to='/onboarding' className='text-primary fw-bold'>
+                        ⭐ Complete Onboarding
+                      </NavDropdown.Item>
+                    )}
                     <NavDropdown.Item as={Link} to='/profile'>
                       Profile
                     </NavDropdown.Item>

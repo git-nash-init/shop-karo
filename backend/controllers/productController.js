@@ -1,66 +1,117 @@
 import asyncHandler from '../middleware/asyncHandler.js';
-import Product from '../models/productModel.js';
+import { supabaseAdmin } from '../config/supabase.js';
 
-// @desc    Fetch all products
+const PAGINATION_LIMIT = parseInt(process.env.PAGINATION_LIMIT) || 8;
+
+// @desc    Fetch all products with optional keyword search and pagination
 // @route   GET /api/products
 // @access  Public
 const getProducts = asyncHandler(async (req, res) => {
-  const pageSize = process.env.PAGINATION_LIMIT;
   const page = Number(req.query.pageNumber) || 1;
+  const keyword = req.query.keyword || '';
 
-  const keyword = req.query.keyword
-    ? {
-        name: {
-          $regex: req.query.keyword,
-          $options: 'i',
-        },
+  let query = supabaseAdmin
+    .from('products')
+    .select('*', { count: 'exact' })
+    .order('created_at', { ascending: false });
+
+  if (keyword) {
+    query = query.textSearch('name', keyword, {
+      type: 'websearch',
+      config: 'english',
+    });
+  }
+
+  const { data: products, count, error } = await query
+    .range((page - 1) * PAGINATION_LIMIT, page * PAGINATION_LIMIT - 1);
+
+  if (error) {
+    // Fallback to ilike if full-text search fails
+    if (keyword) {
+      const { data: fallbackProducts, count: fallbackCount, error: fallbackError } =
+        await supabaseAdmin
+          .from('products')
+          .select('*', { count: 'exact' })
+          .ilike('name', `%${keyword}%`)
+          .order('created_at', { ascending: false })
+          .range((page - 1) * PAGINATION_LIMIT, page * PAGINATION_LIMIT - 1);
+
+      if (fallbackError) {
+        res.status(500);
+        throw new Error('Could not fetch products');
       }
-    : {};
 
-  const count = await Product.countDocuments({ ...keyword });
-  const products = await Product.find({ ...keyword })
-    .limit(pageSize)
-    .skip(pageSize * (page - 1));
+      return res.json({
+        products: fallbackProducts.map(normalizeProduct),
+        page,
+        pages: Math.ceil(fallbackCount / PAGINATION_LIMIT),
+      });
+    }
+    res.status(500);
+    throw new Error('Could not fetch products');
+  }
 
-  res.json({ products, page, pages: Math.ceil(count / pageSize) });
+  res.json({
+    products: products.map(normalizeProduct),
+    page,
+    pages: Math.ceil(count / PAGINATION_LIMIT),
+  });
 });
 
 // @desc    Fetch single product
 // @route   GET /api/products/:id
 // @access  Public
 const getProductById = asyncHandler(async (req, res) => {
-  // NOTE: checking for valid ObjectId to prevent CastError moved to separate
-  // middleware. See README for more info.
+  const { data: product, error } = await supabaseAdmin
+    .from('products')
+    .select(`
+      *,
+      reviews (
+        id,
+        user_id,
+        name,
+        rating,
+        comment,
+        created_at
+      )
+    `)
+    .eq('id', req.params.id)
+    .single();
 
-  const product = await Product.findById(req.params.id);
-  if (product) {
-    return res.json(product);
-  } else {
-    // NOTE: this will run if a valid ObjectId but no product was found
-    // i.e. product may be null
+  if (error || !product) {
     res.status(404);
     throw new Error('Product not found');
   }
+
+  res.json(normalizeProduct(product));
 });
 
 // @desc    Create a product
 // @route   POST /api/products
 // @access  Private/Admin
 const createProduct = asyncHandler(async (req, res) => {
-  const product = new Product({
-    name: 'Sample name',
-    price: 0,
-    user: req.user._id,
-    image: '/images/sample.jpg',
-    brand: 'Sample brand',
-    category: 'Sample category',
-    countInStock: 0,
-    numReviews: 0,
-    description: 'Sample description',
-  });
+  const { data: product, error } = await supabaseAdmin
+    .from('products')
+    .insert({
+      name: 'Sample name',
+      price: 0,
+      user_id: req.user._id,
+      image: '/images/sample.jpg',
+      brand: 'Sample brand',
+      category: 'Sample category',
+      count_in_stock: 0,
+      num_reviews: 0,
+      description: 'Sample description',
+    })
+    .select()
+    .single();
 
-  const createdProduct = await product.save();
-  res.status(201).json(createdProduct);
+  if (error) {
+    res.status(400);
+    throw new Error('Could not create product');
+  }
+
+  res.status(201).json(normalizeProduct(product));
 });
 
 // @desc    Update a product
@@ -70,38 +121,45 @@ const updateProduct = asyncHandler(async (req, res) => {
   const { name, price, description, image, brand, category, countInStock } =
     req.body;
 
-  const product = await Product.findById(req.params.id);
+  const { data: product, error } = await supabaseAdmin
+    .from('products')
+    .update({
+      name,
+      price,
+      description,
+      image,
+      brand,
+      category,
+      count_in_stock: countInStock,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', req.params.id)
+    .select()
+    .single();
 
-  if (product) {
-    product.name = name;
-    product.price = price;
-    product.description = description;
-    product.image = image;
-    product.brand = brand;
-    product.category = category;
-    product.countInStock = countInStock;
-
-    const updatedProduct = await product.save();
-    res.json(updatedProduct);
-  } else {
+  if (error || !product) {
     res.status(404);
     throw new Error('Product not found');
   }
+
+  res.json(normalizeProduct(product));
 });
 
 // @desc    Delete a product
 // @route   DELETE /api/products/:id
 // @access  Private/Admin
 const deleteProduct = asyncHandler(async (req, res) => {
-  const product = await Product.findById(req.params.id);
+  const { error } = await supabaseAdmin
+    .from('products')
+    .delete()
+    .eq('id', req.params.id);
 
-  if (product) {
-    await Product.deleteOne({ _id: product._id });
-    res.json({ message: 'Product removed' });
-  } else {
+  if (error) {
     res.status(404);
     throw new Error('Product not found');
   }
+
+  res.json({ message: 'Product removed' });
 });
 
 // @desc    Create new review
@@ -110,49 +168,79 @@ const deleteProduct = asyncHandler(async (req, res) => {
 const createProductReview = asyncHandler(async (req, res) => {
   const { rating, comment } = req.body;
 
-  const product = await Product.findById(req.params.id);
+  // Check if already reviewed
+  const { data: existing } = await supabaseAdmin
+    .from('reviews')
+    .select('id')
+    .eq('product_id', req.params.id)
+    .eq('user_id', req.user._id)
+    .single();
 
-  if (product) {
-    const alreadyReviewed = product.reviews.find(
-      (r) => r.user.toString() === req.user._id.toString()
-    );
-
-    if (alreadyReviewed) {
-      res.status(400);
-      throw new Error('Product already reviewed');
-    }
-
-    const review = {
-      name: req.user.name,
-      rating: Number(rating),
-      comment,
-      user: req.user._id,
-    };
-
-    product.reviews.push(review);
-
-    product.numReviews = product.reviews.length;
-
-    product.rating =
-      product.reviews.reduce((acc, item) => item.rating + acc, 0) /
-      product.reviews.length;
-
-    await product.save();
-    res.status(201).json({ message: 'Review added' });
-  } else {
-    res.status(404);
-    throw new Error('Product not found');
+  if (existing) {
+    res.status(400);
+    throw new Error('Product already reviewed');
   }
+
+  const { error } = await supabaseAdmin.from('reviews').insert({
+    product_id: req.params.id,
+    user_id: req.user._id,
+    name: req.user.name,
+    rating: Number(rating),
+    comment,
+  });
+
+  if (error) {
+    res.status(400);
+    throw new Error('Could not add review: ' + error.message);
+  }
+
+  res.status(201).json({ message: 'Review added' });
 });
 
 // @desc    Get top rated products
 // @route   GET /api/products/top
 // @access  Public
 const getTopProducts = asyncHandler(async (req, res) => {
-  const products = await Product.find({}).sort({ rating: -1 }).limit(3);
+  const { data: products, error } = await supabaseAdmin
+    .from('products')
+    .select('*')
+    .order('rating', { ascending: false })
+    .limit(3);
 
-  res.json(products);
+  if (error) {
+    res.status(500);
+    throw new Error('Could not fetch top products');
+  }
+
+  res.json(products.map(normalizeProduct));
 });
+
+// Helper to normalize Supabase snake_case → camelCase expected by frontend
+function normalizeProduct(p) {
+  return {
+    _id: p.id,
+    name: p.name,
+    image: p.image,
+    brand: p.brand,
+    category: p.category,
+    description: p.description,
+    price: parseFloat(p.price),
+    countInStock: p.count_in_stock,
+    rating: parseFloat(p.rating),
+    numReviews: p.num_reviews,
+    user: p.user_id,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+    reviews: (p.reviews || []).map((r) => ({
+      _id: r.id,
+      user: r.user_id,
+      name: r.name,
+      rating: r.rating,
+      comment: r.comment,
+      createdAt: r.created_at,
+    })),
+  };
+}
 
 export {
   getProducts,

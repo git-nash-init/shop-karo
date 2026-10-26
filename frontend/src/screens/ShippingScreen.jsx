@@ -9,13 +9,20 @@ import { saveShippingAddress } from '../slices/cartSlice';
 const ShippingScreen = () => {
   const cart = useSelector((state) => state.cart);
   const { shippingAddress } = cart;
+  const { userInfo } = useSelector((state) => state.auth);
 
-  const [address, setAddress] = useState(shippingAddress.address || '');
-  const [city, setCity] = useState(shippingAddress.city || '');
-  const [postalCode, setPostalCode] = useState(
-    shippingAddress.postalCode || ''
+  const [address, setAddress] = useState(
+    shippingAddress.address || userInfo?.address || ''
   );
-  const [country, setCountry] = useState(shippingAddress.country || '');
+  const [city, setCity] = useState(
+    shippingAddress.city || userInfo?.city || ''
+  );
+  const [postalCode, setPostalCode] = useState(
+    shippingAddress.postalCode || userInfo?.postalCode || ''
+  );
+  const [country, setCountry] = useState(
+    shippingAddress.country || userInfo?.country || ''
+  );
 
   const dispatch = useDispatch();
   const navigate = useNavigate();

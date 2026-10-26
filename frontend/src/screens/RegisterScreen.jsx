@@ -28,7 +28,11 @@ const RegisterScreen = () => {
 
   useEffect(() => {
     if (userInfo) {
-      navigate(redirect);
+      if (!userInfo.onboardingCompleted) {
+        navigate('/onboarding?redirect=' + encodeURIComponent(redirect));
+      } else {
+        navigate(redirect);
+      }
     }
   }, [navigate, redirect, userInfo]);
 
@@ -41,7 +45,7 @@ const RegisterScreen = () => {
       try {
         const res = await register({ name, email, password }).unwrap();
         dispatch(setCredentials({ ...res }));
-        navigate(redirect);
+        navigate('/onboarding?redirect=' + encodeURIComponent(redirect));
       } catch (err) {
         toast.error(err?.data?.message || err.error);
       }

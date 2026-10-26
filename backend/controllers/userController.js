@@ -1,6 +1,25 @@
 import asyncHandler from '../middleware/asyncHandler.js';
-import generateToken from '../utils/generateToken.js';
-import User from '../models/userModel.js';
+import { supabaseAdmin } from '../config/supabase.js';
+
+// Helper to normalize profile fields
+function formatUserResponse(user, profile, token = null) {
+  const res = {
+    _id: user.id,
+    name: profile?.name || user.user_metadata?.name || '',
+    email: user.email,
+    isAdmin: profile?.is_admin || false,
+    avatarUrl: profile?.avatar_url || '',
+    phone: profile?.phone || '',
+    address: profile?.address || '',
+    city: profile?.city || '',
+    postalCode: profile?.postal_code || '',
+    country: profile?.country || '',
+    onboardingCompleted: Boolean(profile?.onboarding_completed),
+    preferences: profile?.preferences || {},
+  };
+  if (token) res.token = token;
+  return res;
+}
 
 // @desc    Auth user & get token
 // @route   POST /api/users/auth
@@ -8,21 +27,45 @@ import User from '../models/userModel.js';
 const authUser = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
-  const user = await User.findOne({ email });
+  const {
+    data: { session, user },
+    error,
+  } = await supabaseAdmin.auth.signInWithPassword({ email, password });
 
-  if (user && (await user.matchPassword(password))) {
-    generateToken(res, user._id);
-
-    res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      isAdmin: user.isAdmin,
-    });
-  } else {
+  if (error || !session) {
     res.status(401);
     throw new Error('Invalid email or password');
   }
+
+  // Fetch or upsert profile
+  let { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('id', user.id)
+    .single();
+
+  if (!profile) {
+    const { data: newProfile } = await supabaseAdmin
+      .from('profiles')
+      .upsert({
+        id: user.id,
+        name: user.user_metadata?.name || user.email.split('@')[0],
+        is_admin: user.app_metadata?.is_admin || false,
+      })
+      .select()
+      .single();
+    profile = newProfile;
+  }
+
+  // Set cookie with Supabase access token
+  res.cookie('jwt', session.access_token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'strict',
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  });
+
+  res.json(formatUserResponse(user, profile, session.access_token));
 });
 
 // @desc    Register a new user
@@ -31,32 +74,106 @@ const authUser = asyncHandler(async (req, res) => {
 const registerUser = asyncHandler(async (req, res) => {
   const { name, email, password } = req.body;
 
-  const userExists = await User.findOne({ email });
-
-  if (userExists) {
-    res.status(400);
-    throw new Error('User already exists');
-  }
-
-  const user = await User.create({
-    name,
+  // Create user via Supabase Auth
+  const {
+    data: { user },
+    error,
+  } = await supabaseAdmin.auth.admin.createUser({
     email,
     password,
+    email_confirm: true, // auto-confirm email for frictionless onboarding
+    user_metadata: { name },
   });
 
-  if (user) {
-    generateToken(res, user._id);
-
-    res.status(201).json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      isAdmin: user.isAdmin,
-    });
-  } else {
+  if (error) {
+    if (error.message.toLowerCase().includes('already registered')) {
+      res.status(400);
+      throw new Error('User already exists');
+    }
     res.status(400);
-    throw new Error('Invalid user data');
+    throw new Error(error.message || 'Invalid user data');
   }
+
+  // Ensure profile is immediately populated
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .upsert({
+      id: user.id,
+      name,
+      is_admin: false,
+      onboarding_completed: false,
+    })
+    .select()
+    .single();
+
+  // Sign in immediately to get active session token
+  const {
+    data: { session: signInSession },
+    error: signInError,
+  } = await supabaseAdmin.auth.signInWithPassword({ email, password });
+
+  if (signInError || !signInSession) {
+    res.status(400);
+    throw new Error('Registration succeeded but sign-in failed');
+  }
+
+  // Set cookie
+  res.cookie('jwt', signInSession.access_token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'strict',
+    maxAge: 30 * 24 * 60 * 60 * 1000,
+  });
+
+  res.status(201).json(formatUserResponse(user, profile, signInSession.access_token));
+});
+
+// @desc    Complete client onboarding flow
+// @route   PUT /api/users/onboarding
+// @access  Private
+const completeOnboarding = asyncHandler(async (req, res) => {
+  const {
+    name,
+    phone,
+    address,
+    city,
+    postalCode,
+    country,
+    avatarUrl,
+    preferences,
+  } = req.body;
+
+  const updateData = {
+    onboarding_completed: true,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (name) updateData.name = name;
+  if (phone !== undefined) updateData.phone = phone;
+  if (address !== undefined) updateData.address = address;
+  if (city !== undefined) updateData.city = city;
+  if (postalCode !== undefined) updateData.postal_code = postalCode;
+  if (country !== undefined) updateData.country = country;
+  if (avatarUrl !== undefined) updateData.avatar_url = avatarUrl;
+  if (preferences !== undefined) updateData.preferences = preferences;
+
+  const { data: profile, error } = await supabaseAdmin
+    .from('profiles')
+    .update(updateData)
+    .eq('id', req.user._id)
+    .select()
+    .single();
+
+  if (error || !profile) {
+    res.status(400);
+    throw new Error('Could not update onboarding profile: ' + (error?.message || ''));
+  }
+
+  const {
+    data: { user },
+  } = await supabaseAdmin.auth.admin.getUserById(req.user._id);
+
+  res.json(formatUserResponse(user, profile, req.user.accessToken));
 });
 
 // @desc    Logout user / clear cookie
@@ -71,54 +188,112 @@ const logoutUser = (req, res) => {
 // @route   GET /api/users/profile
 // @access  Private
 const getUserProfile = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
+  const { data: profile, error } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('id', req.user._id)
+    .single();
 
-  if (user) {
-    res.json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      isAdmin: user.isAdmin,
-    });
-  } else {
+  if (error || !profile) {
     res.status(404);
     throw new Error('User not found');
   }
+
+  const {
+    data: { user },
+  } = await supabaseAdmin.auth.admin.getUserById(req.user._id);
+
+  res.json(formatUserResponse(user, profile));
 });
 
 // @desc    Update user profile
 // @route   PUT /api/users/profile
 // @access  Private
 const updateUserProfile = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
+  const updates = {};
+  const profileUpdates = { updated_at: new Date().toISOString() };
 
-  if (user) {
-    user.name = req.body.name || user.name;
-    user.email = req.body.email || user.email;
+  if (req.body.name) profileUpdates.name = req.body.name;
+  if (req.body.phone !== undefined) profileUpdates.phone = req.body.phone;
+  if (req.body.address !== undefined) profileUpdates.address = req.body.address;
+  if (req.body.city !== undefined) profileUpdates.city = req.body.city;
+  if (req.body.postalCode !== undefined) profileUpdates.postal_code = req.body.postalCode;
+  if (req.body.country !== undefined) profileUpdates.country = req.body.country;
+  if (req.body.avatarUrl !== undefined) profileUpdates.avatar_url = req.body.avatarUrl;
+  if (req.body.onboardingCompleted !== undefined) profileUpdates.onboarding_completed = req.body.onboardingCompleted;
 
-    if (req.body.password) {
-      user.password = req.body.password;
-    }
+  const { error: profileError } = await supabaseAdmin
+    .from('profiles')
+    .update(profileUpdates)
+    .eq('id', req.user._id);
 
-    const updatedUser = await user.save();
-
-    res.json({
-      _id: updatedUser._id,
-      name: updatedUser.name,
-      email: updatedUser.email,
-      isAdmin: updatedUser.isAdmin,
-    });
-  } else {
-    res.status(404);
-    throw new Error('User not found');
+  if (profileError) {
+    res.status(400);
+    throw new Error('Could not update profile: ' + profileError.message);
   }
+
+  // Update email / password via Supabase Auth admin API if requested
+  if (req.body.email) updates.email = req.body.email;
+  if (req.body.password) updates.password = req.body.password;
+
+  if (Object.keys(updates).length > 0) {
+    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(
+      req.user._id,
+      updates
+    );
+    if (authError) {
+      res.status(400);
+      throw new Error('Could not update email/password: ' + authError.message);
+    }
+  }
+
+  // Return updated profile
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('id', req.user._id)
+    .single();
+
+  const {
+    data: { user },
+  } = await supabaseAdmin.auth.admin.getUserById(req.user._id);
+
+  res.json(formatUserResponse(user, profile, req.user.accessToken));
 });
 
 // @desc    Get all users
 // @route   GET /api/users
 // @access  Private/Admin
 const getUsers = asyncHandler(async (req, res) => {
-  const users = await User.find({});
+  const { data: authUsers, error } = await supabaseAdmin.auth.admin.listUsers();
+
+  if (error) {
+    res.status(500);
+    throw new Error('Could not fetch users');
+  }
+
+  const { data: profiles } = await supabaseAdmin
+    .from('profiles')
+    .select('*');
+
+  const profileMap = Object.fromEntries(
+    (profiles || []).map((p) => [p.id, p])
+  );
+
+  const users = authUsers.users.map((u) => {
+    const p = profileMap[u.id];
+    return {
+      _id: u.id,
+      name: p?.name || '',
+      email: u.email,
+      isAdmin: p?.is_admin || false,
+      avatarUrl: p?.avatar_url || '',
+      phone: p?.phone || '',
+      onboardingCompleted: Boolean(p?.onboarding_completed),
+      createdAt: u.created_at,
+    };
+  });
+
   res.json(users);
 });
 
@@ -126,62 +301,108 @@ const getUsers = asyncHandler(async (req, res) => {
 // @route   DELETE /api/users/:id
 // @access  Private/Admin
 const deleteUser = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.params.id);
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('is_admin')
+    .eq('id', req.params.id)
+    .single();
 
-  if (user) {
-    if (user.isAdmin) {
-      res.status(400);
-      throw new Error('Can not delete admin user');
-    }
-    await User.deleteOne({ _id: user._id });
-    res.json({ message: 'User removed' });
-  } else {
+  if (!profile) {
     res.status(404);
     throw new Error('User not found');
   }
+
+  if (profile.is_admin) {
+    res.status(400);
+    throw new Error('Cannot delete admin user');
+  }
+
+  const { error } = await supabaseAdmin.auth.admin.deleteUser(req.params.id);
+
+  if (error) {
+    res.status(400);
+    throw new Error('Could not delete user');
+  }
+
+  res.json({ message: 'User removed' });
 });
 
 // @desc    Get user by ID
 // @route   GET /api/users/:id
 // @access  Private/Admin
 const getUserById = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.params.id).select('-password');
+  const {
+    data: { user },
+    error,
+  } = await supabaseAdmin.auth.admin.getUserById(req.params.id);
 
-  if (user) {
-    res.json(user);
-  } else {
+  if (error || !user) {
     res.status(404);
     throw new Error('User not found');
   }
+
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+
+  res.json(formatUserResponse(user, profile));
 });
+
 // @desc    Update user
 // @route   PUT /api/users/:id
 // @access  Private/Admin
 const updateUser = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.params.id);
+  const { name, email, isAdmin, phone, address, city, postalCode, country } = req.body;
 
-  if (user) {
-    user.name = req.body.name || user.name;
-    user.email = req.body.email || user.email;
-    user.isAdmin = Boolean(req.body.isAdmin);
+  const profileUpdate = { updated_at: new Date().toISOString() };
+  if (name !== undefined) profileUpdate.name = name;
+  if (isAdmin !== undefined) profileUpdate.is_admin = isAdmin;
+  if (phone !== undefined) profileUpdate.phone = phone;
+  if (address !== undefined) profileUpdate.address = address;
+  if (city !== undefined) profileUpdate.city = city;
+  if (postalCode !== undefined) profileUpdate.postal_code = postalCode;
+  if (country !== undefined) profileUpdate.country = country;
 
-    const updatedUser = await user.save();
+  const { error } = await supabaseAdmin
+    .from('profiles')
+    .update(profileUpdate)
+    .eq('id', req.params.id);
 
-    res.json({
-      _id: updatedUser._id,
-      name: updatedUser.name,
-      email: updatedUser.email,
-      isAdmin: updatedUser.isAdmin,
-    });
-  } else {
-    res.status(404);
-    throw new Error('User not found');
+  if (error) {
+    res.status(400);
+    throw new Error('Could not update user profile');
   }
+
+  if (email) {
+    const { error } = await supabaseAdmin.auth.admin.updateUserById(
+      req.params.id,
+      { email }
+    );
+    if (error) {
+      res.status(400);
+      throw new Error('Could not update user email');
+    }
+  }
+
+  const { data: profile } = await supabaseAdmin
+    .from('profiles')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
+
+  const {
+    data: { user },
+  } = await supabaseAdmin.auth.admin.getUserById(req.params.id);
+
+  res.json(formatUserResponse(user, profile));
 });
 
 export {
   authUser,
   registerUser,
+  completeOnboarding,
   logoutUser,
   getUserProfile,
   updateUserProfile,

@@ -1,51 +1,64 @@
-import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import colors from 'colors';
-import users from './data/users.js';
+import { supabaseAdmin } from './config/supabase.js';
 import products from './data/products.js';
-import User from './models/userModel.js';
-import Product from './models/productModel.js';
-import Order from './models/orderModel.js';
-import connectDB from './config/db.js';
 
 dotenv.config();
 
-connectDB();
-
 const importData = async () => {
   try {
-    await Order.deleteMany();
-    await Product.deleteMany();
-    await User.deleteMany();
+    console.log('Seeding products to Supabase...'.yellow);
 
-    const createdUsers = await User.insertMany(users);
+    const productsToInsert = products.map((p) => ({
+      name: p.name,
+      image: p.image,
+      brand: p.brand,
+      category: p.category,
+      description: p.description,
+      price: p.price,
+      count_in_stock: p.countInStock,
+      rating: p.rating,
+      num_reviews: p.numReviews,
+    }));
 
-    const adminUser = createdUsers[0]._id;
+    // Upsert products by name
+    const { data, error } = await supabaseAdmin
+      .from('products')
+      .upsert(productsToInsert, { onConflict: 'name' })
+      .select();
 
-    const sampleProducts = products.map((product) => {
-      return { ...product, user: adminUser };
-    });
+    if (error) {
+      // If no unique constraint on name, try plain insert
+      const { data: insData, error: insErr } = await supabaseAdmin
+        .from('products')
+        .insert(productsToInsert)
+        .select();
 
-    await Product.insertMany(sampleProducts);
+      if (insErr) throw insErr;
+      console.log(`Inserted ${insData?.length || 0} products!`.green.inverse);
+    } else {
+      console.log(`Successfully seeded ${data?.length || 0} products into Supabase!`.green.inverse);
+    }
 
-    console.log('Data Imported!'.green.inverse);
-    process.exit();
+    process.exit(0);
   } catch (error) {
-    console.error(`${error}`.red.inverse);
+    console.error(`Error seeding data: ${error.message || error}`.red.inverse);
     process.exit(1);
   }
 };
 
 const destroyData = async () => {
   try {
-    await Order.deleteMany();
-    await Product.deleteMany();
-    await User.deleteMany();
+    console.log('Cleaning Supabase test data...'.yellow);
+    await supabaseAdmin.from('order_items').delete().neq('quantity', -1);
+    await supabaseAdmin.from('orders').delete().neq('total_price', -1);
+    await supabaseAdmin.from('reviews').delete().neq('rating', -1);
+    await supabaseAdmin.from('products').delete().neq('price', -1);
 
     console.log('Data Destroyed!'.red.inverse);
-    process.exit();
+    process.exit(0);
   } catch (error) {
-    console.error(`${error}`.red.inverse);
+    console.error(`Error deleting data: ${error.message || error}`.red.inverse);
     process.exit(1);
   }
 };
