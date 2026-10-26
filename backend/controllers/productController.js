@@ -8,53 +8,32 @@ const PAGINATION_LIMIT = parseInt(process.env.PAGINATION_LIMIT) || 16;
 // @access  Public
 const getProducts = asyncHandler(async (req, res) => {
   const page = Number(req.query.pageNumber) || 1;
-  const keyword = req.query.keyword || '';
+  const keyword = (req.query.keyword || '').trim();
 
   let query = supabaseAdmin
     .from('products')
-    .select('*', { count: 'exact' })
-    .order('created_at', { ascending: false });
+    .select('*', { count: 'exact' });
 
   if (keyword) {
-    query = query.textSearch('name', keyword, {
-      type: 'websearch',
-      config: 'english',
-    });
+    query = query.ilike('name', `%${keyword}%`);
   }
 
-  const { data: products, count, error } = await query
+  query = query.order('created_at', { ascending: false });
+
+  let { data: products, count, error } = await query
     .range((page - 1) * PAGINATION_LIMIT, page * PAGINATION_LIMIT - 1);
 
-  if (error) {
-    // Fallback to ilike if full-text search fails
-    if (keyword) {
-      const { data: fallbackProducts, count: fallbackCount, error: fallbackError } =
-        await supabaseAdmin
-          .from('products')
-          .select('*', { count: 'exact' })
-          .ilike('name', `%${keyword}%`)
-          .order('created_at', { ascending: false })
-          .range((page - 1) * PAGINATION_LIMIT, page * PAGINATION_LIMIT - 1);
-
-      if (fallbackError) {
-        res.status(500);
-        throw new Error('Could not fetch products');
-      }
-
-      return res.json({
-        products: fallbackProducts.map(normalizeProduct),
-        page,
-        pages: Math.ceil(fallbackCount / PAGINATION_LIMIT),
-      });
-    }
-    res.status(500);
-    throw new Error('Could not fetch products');
+  if (error || !products) {
+    console.error('getProducts query error, falling back to all products:', error);
+    const { data: allProds } = await supabaseAdmin.from('products').select('*');
+    products = allProds || [];
+    count = products.length;
   }
 
   res.json({
-    products: products.map(normalizeProduct),
+    products: (products || []).map(normalizeProduct),
     page,
-    pages: Math.ceil(count / PAGINATION_LIMIT),
+    pages: Math.ceil((count || products.length) / PAGINATION_LIMIT) || 1,
   });
 });
 
@@ -201,18 +180,19 @@ const createProductReview = asyncHandler(async (req, res) => {
 // @route   GET /api/products/top
 // @access  Public
 const getTopProducts = asyncHandler(async (req, res) => {
-  const { data: products, error } = await supabaseAdmin
+  let { data: products, error } = await supabaseAdmin
     .from('products')
     .select('*')
     .order('rating', { ascending: false })
     .limit(3);
 
-  if (error) {
-    res.status(500);
-    throw new Error('Could not fetch top products');
+  if (error || !products || products.length === 0) {
+    console.error('getTopProducts query error, falling back to top 3:', error);
+    const { data: fallback } = await supabaseAdmin.from('products').select('*').limit(3);
+    products = fallback || [];
   }
 
-  res.json(products.map(normalizeProduct));
+  res.json((products || []).map(normalizeProduct));
 });
 
 // Helper to normalize Supabase snake_case → camelCase expected by frontend

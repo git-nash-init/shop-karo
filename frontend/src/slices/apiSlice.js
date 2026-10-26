@@ -10,13 +10,26 @@ import { logout } from './authSlice'; // Import the logout action
 
 const baseQuery = fetchBaseQuery({
   baseUrl: BASE_URL,
+  credentials: 'include',
+  prepareHeaders: (headers, { getState }) => {
+    const token = getState().auth?.userInfo?.token;
+    if (token) {
+      headers.set('authorization', `Bearer ${token}`);
+    }
+    return headers;
+  },
 });
 
 async function baseQueryWithAuth(args, api, extra) {
   const result = await baseQuery(args, api, extra);
-  // Dispatch the logout action on 401.
+  // Dispatch logout ONLY on 401 when the user was actually logged in with a token
+  // and the endpoint wasn't a login attempt
   if (result.error && result.error.status === 401) {
-    api.dispatch(logout());
+    const url = typeof args === 'string' ? args : args.url || '';
+    const hasToken = Boolean(api.getState().auth?.userInfo?.token);
+    if (!url.includes('/users/auth') && hasToken) {
+      api.dispatch(logout());
+    }
   }
   return result;
 }
