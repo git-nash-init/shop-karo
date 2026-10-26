@@ -1,7 +1,7 @@
 import asyncHandler from '../middleware/asyncHandler.js';
 import { supabaseAdmin } from '../config/supabase.js';
 
-const PAGINATION_LIMIT = parseInt(process.env.PAGINATION_LIMIT) || 8;
+const PAGINATION_LIMIT = parseInt(process.env.PAGINATION_LIMIT) || 16;
 
 // @desc    Fetch all products with optional keyword search and pagination
 // @route   GET /api/products

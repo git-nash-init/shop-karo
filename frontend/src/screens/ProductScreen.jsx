@@ -81,7 +81,15 @@ const ProductScreen = () => {
           <Meta title={product.name} description={product.description} />
           <Row>
             <Col md={6}>
-              <Image src={product.image} alt={product.name} fluid />
+              <Image
+                src={product.image}
+                alt={product.name}
+                fluid
+                onError={(e) => {
+                  e.target.onerror = null;
+                  e.target.src = '/images/sample.jpg';
+                }}
+              />
             </Col>
             <Col md={3}>
               <ListGroup variant='flush'>

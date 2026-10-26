@@ -26,11 +26,22 @@ app.get('/api/config/paypal', (req, res) =>
   res.send({ clientId: process.env.PAYPAL_CLIENT_ID || 'mock_paypal_client_id' })
 );
 
+const __dirname = path.resolve();
+
+// Static images serving for local and development runs
+app.use('/images', express.static(path.join(__dirname, 'frontend', 'public', 'images')));
+
 // API Routes
 app.use('/api/products', productRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/upload', uploadRoutes);
+
+// Fallbacks if serverless rewrite passes paths without /api prefix
+app.use('/products', productRoutes);
+app.use('/users', userRoutes);
+app.use('/orders', orderRoutes);
+app.use('/upload', uploadRoutes);
 
 // Fallback for root API call
 app.get('/api', (req, res) => {
@@ -39,7 +50,6 @@ app.get('/api', (req, res) => {
 
 // In local production mode (non-Vercel), serve frontend build
 if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
-  const __dirname = path.resolve();
   app.use(express.static(path.join(__dirname, '/frontend/build')));
   app.get('*', (req, res) =>
     res.sendFile(path.resolve(__dirname, 'frontend', 'build', 'index.html'))
